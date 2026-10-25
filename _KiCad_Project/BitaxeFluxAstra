@@ -1,0 +1,679 @@
+# BitaxeFluxAstra_DRC_autofix_inplace.py
+# KiCad 10 / pcbnew Python
+#
+# التعديلات المسموحة فقط:
+# 1) تكبير قطر النحاس للفياز التي لا تحقق annular ring = 0.127 mm
+# 2) رفع سماكة نصوص References المحددة في تقرير DRC إلى 0.15 mm
+#
+# ممنوع:
+# - تحريك أي Footprint
+# - تحريك أي Via
+# - تغيير Via drill
+# - تحريك أو تغيير سماكة أي Track
+# - تغيير Layer أو Net
+# - تعديل Pads أو Footprint geometry
+#
+# يحفظ مباشرة فوق ملف PCB الحالي
+
+import math
+from pathlib import Path
+from collections import Counter
+
+import pcbnew
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+MIN_VIA_ANNULAR_MM = 0.127
+TEXT_THICKNESS_MM = 0.150
+
+
+# النصوص التي ظهرت في تقرير DRC فقط
+TEXT_REFS = {
+    "D1",
+    "R54",
+    "R53",
+    "R55",
+    "R52",
+    "R50",
+    "R57",
+    "R48",
+    "R56",
+    "R51",
+    "C44",
+    "C16",
+    "C21",
+    "R59",
+    "R58",
+    "C201",
+    "C45",
+    "C202",
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def mm(value):
+    return pcbnew.ToMM(value)
+
+
+def iu(value_mm):
+    return pcbnew.FromMM(value_mm)
+
+
+def round_up_0p01(value_mm):
+    """
+    Round upward to nearest 0.01 mm.
+    Example:
+        0.554 -> 0.56
+    """
+    return math.ceil(
+        (value_mm - 1e-12) * 100.0
+    ) / 100.0
+
+
+# ============================================================
+# GET CURRENT PCB
+# ============================================================
+
+board = pcbnew.GetBoard()
+
+if board is None:
+    raise RuntimeError(
+        "No PCB is currently open in KiCad PCB Editor."
+    )
+
+
+src_name = board.GetFileName()
+
+if not src_name:
+    raise RuntimeError(
+        "Save the PCB once before running this script."
+    )
+
+
+src = Path(src_name)
+
+if not src.exists():
+    raise FileNotFoundError(src)
+
+
+log_path = src.with_name(
+    src.stem + "_DRC_autofix_log.txt"
+)
+
+
+print("=" * 72)
+print("BitaxeFluxAstra DRC autofix")
+print(f"PCB: {src}")
+print("=" * 72)
+
+
+# ============================================================
+# LOG
+# ============================================================
+
+log = []
+
+log.append(
+    f"PCB modified in place: {src}"
+)
+
+log.append("")
+
+
+# ============================================================
+# SAFETY SNAPSHOT
+# FOOTPRINT POSITIONS / ORIENTATION
+# ============================================================
+
+fp_before = {}
+
+for fp in board.GetFootprints():
+
+    ref = fp.GetReference()
+
+    fp_before[ref] = (
+        fp.GetPosition().x,
+        fp.GetPosition().y,
+        fp.GetOrientationDegrees(),
+    )
+
+
+# ============================================================
+# SAFETY SNAPSHOT
+# TRACK GEOMETRY
+# ============================================================
+
+track_before = Counter()
+
+for item in board.GetTracks():
+
+    # Vias handled separately
+    if isinstance(item, pcbnew.PCB_VIA):
+        continue
+
+    track_before.update([
+        (
+            item.GetStart().x,
+            item.GetStart().y,
+
+            item.GetEnd().x,
+            item.GetEnd().y,
+
+            item.GetWidth(),
+
+            item.GetLayer(),
+
+            item.GetNetCode(),
+        )
+    ])
+
+
+# ============================================================
+# SAFETY SNAPSHOT
+# VIA POSITION / DRILL / NET
+# ============================================================
+
+via_before = Counter()
+
+for item in board.GetTracks():
+
+    if not isinstance(item, pcbnew.PCB_VIA):
+        continue
+
+    via_before.update([
+        (
+            item.GetPosition().x,
+            item.GetPosition().y,
+
+            item.GetDrillValue(),
+
+            item.GetNetCode(),
+        )
+    ])
+
+
+# ============================================================
+# 1) FIX VIA ANNULAR RING
+# ============================================================
+
+via_changes = []
+
+
+for item in board.GetTracks():
+
+    if not isinstance(item, pcbnew.PCB_VIA):
+        continue
+
+
+    drill_mm = mm(
+        item.GetDrillValue()
+    )
+
+    diameter_mm = mm(
+        item.GetWidth()
+    )
+
+
+    annular_mm = (
+        diameter_mm - drill_mm
+    ) / 2.0
+
+
+    # Already valid
+    if annular_mm + 1e-9 >= MIN_VIA_ANNULAR_MM:
+        continue
+
+
+    # Required diameter:
+    #
+    # diameter =
+    # drill + 2 * annular ring
+    #
+    required_diameter_mm = (
+        drill_mm
+        + 2.0 * MIN_VIA_ANNULAR_MM
+    )
+
+
+    new_diameter_mm = round_up_0p01(
+        required_diameter_mm
+    )
+
+
+    # Extra safety:
+    # never decrease via diameter
+    if new_diameter_mm <= diameter_mm:
+        continue
+
+
+    # --------------------------------------------------------
+    # Store protected properties
+    # --------------------------------------------------------
+
+    old_x = item.GetPosition().x
+    old_y = item.GetPosition().y
+
+    old_drill = item.GetDrillValue()
+    old_net = item.GetNetCode()
+
+
+    try:
+        net_name = item.GetNetname()
+    except Exception:
+        net_name = ""
+
+
+    # --------------------------------------------------------
+    # ONLY CHANGE VIA COPPER DIAMETER
+    # --------------------------------------------------------
+
+    item.SetWidth(
+        iu(new_diameter_mm)
+    )
+
+
+    # --------------------------------------------------------
+    # IMMEDIATE SAFETY CHECK
+    # --------------------------------------------------------
+
+    assert item.GetPosition().x == old_x, \
+        "ABORT: Via X position changed."
+
+    assert item.GetPosition().y == old_y, \
+        "ABORT: Via Y position changed."
+
+    assert item.GetDrillValue() == old_drill, \
+        "ABORT: Via drill changed."
+
+    assert item.GetNetCode() == old_net, \
+        "ABORT: Via net changed."
+
+
+    new_annular_mm = (
+        new_diameter_mm - drill_mm
+    ) / 2.0
+
+
+    via_changes.append(
+
+        f"Via @ "
+        f"({mm(old_x):.4f}, {mm(old_y):.4f}) mm "
+
+        f"net={net_name} : "
+
+        f"diameter "
+        f"{diameter_mm:.3f} -> "
+        f"{new_diameter_mm:.3f} mm, "
+
+        f"drill "
+        f"{drill_mm:.3f} mm, "
+
+        f"annular "
+        f"{annular_mm:.3f} -> "
+        f"{new_annular_mm:.3f} mm"
+    )
+
+
+# ============================================================
+# 2) FIX REFERENCE TEXT THICKNESS
+# ============================================================
+
+text_changes = []
+
+
+for fp in board.GetFootprints():
+
+    ref = fp.GetReference()
+
+
+    if ref not in TEXT_REFS:
+        continue
+
+
+    field = fp.Reference()
+
+
+    old_thickness_mm = mm(
+        field.GetTextThickness()
+    )
+
+
+    # Already valid
+    if old_thickness_mm + 1e-9 >= TEXT_THICKNESS_MM:
+        continue
+
+
+    # --------------------------------------------------------
+    # Store protected properties
+    # --------------------------------------------------------
+
+    old_pos_x = field.GetPosition().x
+    old_pos_y = field.GetPosition().y
+
+    old_size_x = field.GetTextSize().x
+    old_size_y = field.GetTextSize().y
+
+    old_angle = (
+        field.GetTextAngleDegrees()
+    )
+
+
+    # --------------------------------------------------------
+    # ONLY CHANGE TEXT STROKE THICKNESS
+    # --------------------------------------------------------
+
+    field.SetTextThickness(
+        iu(TEXT_THICKNESS_MM)
+    )
+
+
+    # --------------------------------------------------------
+    # SAFETY CHECK
+    # --------------------------------------------------------
+
+    assert field.GetPosition().x == old_pos_x, \
+        f"ABORT: {ref} text X moved."
+
+    assert field.GetPosition().y == old_pos_y, \
+        f"ABORT: {ref} text Y moved."
+
+    assert field.GetTextSize().x == old_size_x, \
+        f"ABORT: {ref} text width changed."
+
+    assert field.GetTextSize().y == old_size_y, \
+        f"ABORT: {ref} text height changed."
+
+    assert abs(
+        field.GetTextAngleDegrees()
+        - old_angle
+    ) < 1e-9, \
+        f"ABORT: {ref} text rotation changed."
+
+
+    text_changes.append(
+
+        f"{ref}: "
+        f"reference text thickness "
+
+        f"{old_thickness_mm:.3f} -> "
+        f"{TEXT_THICKNESS_MM:.3f} mm"
+    )
+
+
+# ============================================================
+# FINAL SAFETY CHECK
+# FOOTPRINTS
+# ============================================================
+
+fp_after = {}
+
+for fp in board.GetFootprints():
+
+    ref = fp.GetReference()
+
+    fp_after[ref] = (
+        fp.GetPosition().x,
+        fp.GetPosition().y,
+        fp.GetOrientationDegrees(),
+    )
+
+
+assert fp_before == fp_after, \
+    "ABORT: A footprint position or orientation changed."
+
+
+# ============================================================
+# FINAL SAFETY CHECK
+# TRACKS
+# ============================================================
+
+track_after = Counter()
+
+
+for item in board.GetTracks():
+
+    if isinstance(item, pcbnew.PCB_VIA):
+        continue
+
+
+    track_after.update([
+        (
+            item.GetStart().x,
+            item.GetStart().y,
+
+            item.GetEnd().x,
+            item.GetEnd().y,
+
+            item.GetWidth(),
+
+            item.GetLayer(),
+
+            item.GetNetCode(),
+        )
+    ])
+
+
+assert track_before == track_after, \
+    "ABORT: Track geometry, width, layer or net changed."
+
+
+# ============================================================
+# FINAL SAFETY CHECK
+# VIA POSITIONS / DRILLS / NETS
+# ============================================================
+
+via_after = Counter()
+
+
+for item in board.GetTracks():
+
+    if not isinstance(item, pcbnew.PCB_VIA):
+        continue
+
+
+    via_after.update([
+        (
+            item.GetPosition().x,
+            item.GetPosition().y,
+
+            item.GetDrillValue(),
+
+            item.GetNetCode(),
+        )
+    ])
+
+
+assert via_before == via_after, \
+    "ABORT: Via position, drill or net changed."
+
+
+# ============================================================
+# SAVE OVER CURRENT PCB
+# ============================================================
+
+pcbnew.SaveBoard(
+    str(src),
+    board
+)
+
+
+pcbnew.Refresh()
+
+
+# ============================================================
+# LOG
+# ============================================================
+
+log.append(
+    f"Via diameter changes: "
+    f"{len(via_changes)}"
+)
+
+for entry in via_changes:
+    log.append(
+        "  " + entry
+    )
+
+
+log.append("")
+
+
+log.append(
+    f"Reference text thickness changes: "
+    f"{len(text_changes)}"
+)
+
+for entry in text_changes:
+    log.append(
+        "  " + entry
+    )
+
+
+log.append("")
+
+log.append(
+    "NOT modified by this script:"
+)
+
+log.append(
+    "  - Footprint positions"
+)
+
+log.append(
+    "  - Footprint orientations"
+)
+
+log.append(
+    "  - Track positions"
+)
+
+log.append(
+    "  - Track widths"
+)
+
+log.append(
+    "  - Track layers"
+)
+
+log.append(
+    "  - Track nets"
+)
+
+log.append(
+    "  - Via positions"
+)
+
+log.append(
+    "  - Via drills"
+)
+
+log.append(
+    "  - Via nets"
+)
+
+log.append(
+    "  - Pads"
+)
+
+log.append(
+    "  - Footprint geometry"
+)
+
+log.append(
+    "  - Silkscreen outlines"
+)
+
+log.append(
+    "  - LCD_D1 dangling routing"
+)
+
+log.append(
+    "  - LCD_D2 dangling routing"
+)
+
+log.append(
+    "  - Library footprint warnings"
+)
+
+
+log.append("")
+
+log.append(
+    "Next step: rerun DRC."
+)
+
+
+log_path.write_text(
+    "\n".join(log),
+    encoding="utf-8"
+)
+
+
+# ============================================================
+# RESULT
+# ============================================================
+
+print("")
+print("=" * 72)
+
+print(
+    "DRC surgical autofix completed successfully"
+)
+
+print("")
+
+print(
+    f"PCB saved directly to:"
+)
+
+print(
+    f"{src}"
+)
+
+print("")
+
+print(
+    f"Vias resized: "
+    f"{len(via_changes)}"
+)
+
+print(
+    f"Text references updated: "
+    f"{len(text_changes)}"
+)
+
+print("")
+
+print(
+    "No footprints were moved."
+)
+
+print(
+    "No tracks were changed."
+)
+
+print(
+    "No vias were moved."
+)
+
+print(
+    "No via drills were changed."
+)
+
+print("")
+
+print(
+    f"Log:"
+)
+
+print(
+    f"{log_path}"
+)
+
+print("=" * 72)
